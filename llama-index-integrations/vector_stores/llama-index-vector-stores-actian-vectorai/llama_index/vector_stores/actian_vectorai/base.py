@@ -2,12 +2,9 @@
 Actian Vector AI Vector store index.
 """
 
-from __future__ import annotations
+from typing import Any, Dict, List, Optional, Sequence
 
-from hashlib import sha1
-from http import client
-from typing import Any, Dict, List, Optional, Sequence, Union
-import asyncio
+from typing_extensions import Self
 
 from llama_index.core.bridge.pydantic import PrivateAttr
 from llama_index.core.schema import BaseNode
@@ -22,7 +19,6 @@ from llama_index.core.vector_stores.types import (
 )
 
 from llama_index.core.vector_stores.utils import (
-    legacy_metadata_dict_to_node,
     metadata_dict_to_node,
     node_to_metadata_dict,
 )
@@ -31,10 +27,8 @@ from actian_vectorai import (
     Condition,
     Field,
     FilterBuilder,
-    HnswConfigDiff,
     VectorAIClient,
     AsyncVectorAIClient,
-    WalConfigDiff,
     Filter,
     is_empty,
     has_id,
@@ -42,43 +36,42 @@ from actian_vectorai import (
 
 from actian_vectorai.models import (
     Distance,
-    IndexType,
-    OptimizersConfigDiff,
-    QuantizationConfig,
     PointStruct,
     ScoredPoint,
-    ShardingMethod,
-    UpdateResult,
     UpdateStatus,
     VectorParams,
 )
 
 
 class ActianVectorAIVectorStore(BasePydanticVectorStore):
-
-    stores_text: bool = True
+    stores_text: bool = False
     flat_metadata: bool = False
 
     url: str
     collection_name: str
     client_kwargs: Optional[Dict[str, Any]]
     collection_kwargs: Optional[Dict[str, Any]]
+    dense_vector_name: str
+    dense_vector_params: Optional[VectorParams]
 
     _client: VectorAIClient = PrivateAttr(None)
     _async_client: AsyncVectorAIClient = PrivateAttr(None)
     _collection_exists: bool = PrivateAttr(False)
     _clear_existing_collection: bool = PrivateAttr(False)
-    _lazy_collection_create: bool = PrivateAttr(False)
+    _lazy_collection_exist_check: bool = PrivateAttr(False)
 
     def __init__(
         self,
         url: str = "localhost:50051",
         collection_name: str = "llama_index_collection",
         client_kwargs: Optional[dict[str, Any]] = None,
+        dense_vector_name: str = "llama_index_dense_vector",
+        dense_vector_params: Optional[VectorParams] = None,
         collection_kwargs: Optional[dict[str, Any]] = None,
+        stores_text: bool = False,
+        clear_existing_collection: bool = False,
         client: Optional[VectorAIClient] = None,
         async_client: Optional[AsyncVectorAIClient] = None,
-        clear_existing_collection: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -86,6 +79,9 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
             collection_name=collection_name,
             client_kwargs=client_kwargs,
             collection_kwargs=collection_kwargs,
+            stores_text=stores_text,
+            dense_vector_name=dense_vector_name,
+            dense_vector_params=dense_vector_params,
             **kwargs,
         )
 
@@ -110,7 +106,7 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
                     )
                 self._async_client = async_client
 
-    def __enter__(self) -> ActianVectorAIVectorStore:
+    def __enter__(self) -> Self:
         if self._client is None:
             raise ValueError(
                 "Synchronous client is not initialized. Please initialize the ActianVectorAIVectorStore with a VectorAIClient to use synchronous methods."
@@ -119,11 +115,12 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
             self._client.connect()
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
+    def __exit__(self, exc_type, exc_val, exc_tb) -> Self:
         if self._client.is_connected:
             self._client.shutdown()
+        return self
 
-    async def __aenter__(self) -> ActianVectorAIVectorStore:
+    async def __aenter__(self) -> Self:
         if self._async_client is None:
             raise ValueError(
                 "Async client is not initialized. Please initialize the ActianVectorAIVectorStore with an AsyncVectorAIClient to use asynchronous methods."
@@ -132,9 +129,10 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
             await self._async_client.connect()
         return self
 
-    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> Self:
         if self._async_client is not None and self._async_client.is_connected:
             await self._async_client.close()
+        return self
 
     @classmethod
     def class_name(cls) -> str:
@@ -169,10 +167,15 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
         Args:
             node_ids (List[str]): List of node ids to get.
             filters (MetadataFilters): Metadata filters to apply to query.
+
         Returns:
             List[BaseNode]: List of nodes matching query.
+
         """
         self._lazy_client_operation_check()
+
+        if not self._collection_exists:
+            return []
 
         raise NotImplementedError(  # Waiting on implementation of scroll method in Actian Vector AI client
             "ActianVectorAIVectorStore.get_nodes() is not implemented."
@@ -185,6 +188,9 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
     ) -> List[BaseNode]:
         """Asynchronously get nodes from vector store."""
         await self._lazy_async_client_operation_check()
+
+        if not self._collection_exists:
+            return []
 
         raise NotImplementedError(  # Waiting on implementation of scroll method in Actian Vector AI client
             "ActianVectorAIVectorStore.aget_nodes() is not implemented."
@@ -202,7 +208,7 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
             nodes: List[BaseNode]: list of nodes with embeddings
 
         """
-        self._lazy_client_operation_check(ensure_collection_exists=False)
+        self._lazy_client_operation_check()
 
         if not len(nodes) > 0:
             return []
@@ -211,29 +217,29 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
 
         points, ids = self._build_points_from_nodes(nodes)
         result = self._client.points.upsert(self.collection_name, points)
-        assert (
-            result.status == UpdateStatus.Completed
-        ), f"Failed to add points to collection {self.collection_name}. Response: {result}"
+        assert result.status == UpdateStatus.Completed, (
+            f"Failed to add points to collection {self.collection_name}. Response: {result}"
+        )
         return ids
 
-    async def aadd(
+    async def async_add(
         self,
         nodes: Sequence[BaseNode],
         **kwargs: Any,
     ) -> List[str]:
         """Asynchronously add nodes to index."""
+        await self._lazy_async_client_operation_check()
+
         if not len(nodes) > 0:
             return []
-
-        await self._lazy_async_client_operation_check(ensure_collection_exists=False)
 
         await self._acreate_collection_if_not_exists(len(nodes[0].get_embedding()))
 
         points, ids = self._build_points_from_nodes(nodes)
         result = await self._async_client.points.upsert(self.collection_name, points)
-        assert (
-            result.status == UpdateStatus.Completed
-        ), f"Failed to add points to collection {self.collection_name}. Response: {result}"
+        assert result.status == UpdateStatus.Completed, (
+            f"Failed to add points to collection {self.collection_name}. Response: {result}"
+        )
         return ids
 
     def delete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
@@ -246,27 +252,33 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
         """
         self._lazy_client_operation_check()
 
+        if not self._collection_exists:
+            return
+
         result = self._client.points.delete(
             self.collection_name,
             filter=FilterBuilder().must(Field("ref_doc_id").eq(ref_doc_id)).build(),
         )
 
-        assert (
-            result.status == UpdateStatus.Completed
-        ), f"Failed to delete points with ref_doc_id {ref_doc_id} from collection {self.collection_name}. Response: {result}"
+        assert result.status == UpdateStatus.Completed, (
+            f"Failed to delete points with ref_doc_id {ref_doc_id} from collection {self.collection_name}. Response: {result}"
+        )
 
     async def adelete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
         """Asynchronously delete nodes using with ref_doc_id."""
         await self._lazy_async_client_operation_check()
+
+        if not self._collection_exists:
+            return
 
         result = await self._async_client.points.delete(
             self.collection_name,
             filter=FilterBuilder().must(Field("ref_doc_id").eq(ref_doc_id)).build(),
         )
 
-        assert (
-            result.status == UpdateStatus.Completed
-        ), f"Failed to delete points with ref_doc_id {ref_doc_id} from collection {self.collection_name}. Response: {result}"
+        assert result.status == UpdateStatus.Completed, (
+            f"Failed to delete points with ref_doc_id {ref_doc_id} from collection {self.collection_name}. Response: {result}"
+        )
 
     def delete_nodes(
         self,
@@ -283,15 +295,18 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
         """
         self._lazy_client_operation_check()
 
+        if not self._collection_exists:
+            return
+
         result = self._client.points.delete(
             self.collection_name,
             ids=node_ids,
             filter=self._build_db_filter_from_metadata_filters(filters),
         )
 
-        assert (
-            result.status == UpdateStatus.Completed
-        ), f"Failed to delete points with ids {node_ids} from collection {self.collection_name}. Response: {result}"
+        assert result.status == UpdateStatus.Completed, (
+            f"Failed to delete points from collection {self.collection_name}. Response: {result}"
+        )
 
     async def adelete_nodes(
         self,
@@ -302,15 +317,18 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
         """Asynchronously delete nodes using list of node ids."""
         await self._lazy_async_client_operation_check()
 
+        if not self._collection_exists:
+            return
+
         result = await self._async_client.points.delete(
             self.collection_name,
             ids=node_ids,
             filter=self._build_db_filter_from_metadata_filters(filters),
         )
 
-        assert (
-            result.status == UpdateStatus.Completed
-        ), f"Failed to delete points with ids {node_ids} from collection {self.collection_name}. Response: {result}"
+        assert result.status == UpdateStatus.Completed, (
+            f"Failed to delete points with ids {node_ids} from collection {self.collection_name}. Response: {result}"
+        )
 
     def clear(self) -> None:
         """
@@ -318,10 +336,13 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
         """
         self._lazy_client_operation_check()
 
+        if not self._collection_exists:
+            return
+
         result = self._client.collections.delete(self.collection_name)
-        assert (
-            result == True
-        ), f"Failed to clear collection {self.collection_name}. Response: {result}"
+        assert result, (
+            f"Failed to clear collection {self.collection_name}. Response: {result}"
+        )
 
         self._collection_exists = False
 
@@ -331,10 +352,13 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
         """
         await self._lazy_async_client_operation_check()
 
+        if not self._collection_exists:
+            return
+
         result = await self._async_client.collections.delete(self.collection_name)
-        assert (
-            result == True
-        ), f"Failed to clear collection {self.collection_name}. Response: {result}"
+        assert result, (
+            f"Failed to clear collection {self.collection_name}. Response: {result}"
+        )
 
         self._collection_exists = False
 
@@ -348,19 +372,23 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
         """
         self._lazy_client_operation_check()
 
-        if query.mode != VectorStoreQueryMode.DEFAULT:
-            raise NotImplementedError(
-                "Only DEFAULT query mode is supported for ActianVectorAIVectorStore."
-            )
+        if not self._collection_exists:
+            return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
 
-        results = self._client.points.search(
-            self.collection_name,
-            query.query_embedding,
-            limit=query.similarity_top_k,
-            filter=self._build_db_filter_from_vector_store_query(query),
-            **kwargs,
+        if query.mode == VectorStoreQueryMode.DEFAULT:
+            results = self.client.points.search(
+                self.collection_name,
+                query.query_embedding,
+                using=self.dense_vector_name,
+                limit=query.similarity_top_k,
+                filter=self._build_db_filter_from_vector_store_query(query),
+                **kwargs,
+            )
+            return self._build_vector_store_query_result_from_scored_points(results)
+
+        raise NotImplementedError(
+            "Only DEFAULT query mode is supported for ActianVectorAIVectorStore."
         )
-        return self._build_vector_store_query_result_from_scored_points(results)
 
     async def aquery(
         self, query: VectorStoreQuery, **kwargs: Any
@@ -368,19 +396,23 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
         """Asynchronously query index for top k most similar nodes."""
         await self._lazy_async_client_operation_check()
 
-        if query.mode != VectorStoreQueryMode.DEFAULT:
-            raise NotImplementedError(
-                "Only DEFAULT query mode is supported for ActianVectorAIVectorStore."
-            )
+        if not self._collection_exists:
+            return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
 
-        results = await self._async_client.points.search(
-            self.collection_name,
-            query.query_embedding,
-            limit=query.similarity_top_k,
-            filter=self._build_db_filter_from_vector_store_query(query),
-            **kwargs,
+        if query.mode == VectorStoreQueryMode.DEFAULT:
+            results = await self._async_client.points.search(
+                self.collection_name,
+                query.query_embedding,
+                using=self.dense_vector_name,
+                limit=query.similarity_top_k,
+                filter=self._build_db_filter_from_vector_store_query(query),
+                **kwargs,
+            )
+            return self._build_vector_store_query_result_from_scored_points(results)
+
+        raise NotImplementedError(
+            "Only DEFAULT query mode is supported for ActianVectorAIVectorStore."
         )
-        return self._build_vector_store_query_result_from_scored_points(results)
 
     def connect(self) -> None:
         """Connect to Actian Vector AI client."""
@@ -421,18 +453,23 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
 
         Returns:
             tuple[List[PointStruct], List[str]]: list of points to add to Actian Vector AI collection and their corresponding IDs
+
         """
         points = []
         ids = []
 
         for node in nodes:
             metadata = node_to_metadata_dict(
-                node, remove_text=False, flat_metadata=self.flat_metadata
+                node, remove_text=not self.stores_text, flat_metadata=self.flat_metadata
             )
+
+            _vector = {}
+
+            _vector[self.dense_vector_name] = node.get_embedding()
 
             point = PointStruct(
                 id=node.node_id,
-                vector=node.get_embedding(),
+                vector=_vector,
                 payload=metadata,
             )
 
@@ -448,6 +485,7 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
 
         Args:
             filters: MetadataFilters object containing list of filter groups
+
         """
         if filters is None:
             return None
@@ -506,13 +544,9 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
                     FilterOperator.LTE: lambda key, value: Field(key).lte(float(value)),
                     FilterOperator.IN: filter_operation_to_condition_in,
                     FilterOperator.NIN: filter_operation_to_condition_nin,
-                    # FilterOperator.ANY: raise NotImplementedError
-                    # FilterOperator.ALL: raise NotImplementedError
                     FilterOperator.TEXT_MATCH: lambda key, value: Field(key).text(
                         value
                     ),
-                    # FilterOperator.TEXT_MATCH_INSENSITIVE: raise NotImplementedError
-                    # FilterOperator.CONTAINS: raise NotImplementedError
                     FilterOperator.IS_EMPTY: lambda key, value: is_empty(key),
                 }
 
@@ -528,6 +562,10 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
             return Filter(should=conditions)
         elif filters.condition == FilterCondition.NOT:
             return Filter(must_not=conditions)
+        else:
+            raise NotImplementedError(
+                f"Unsupported filter condition: {filters.condition}"
+            )
 
     def _build_db_filter_from_vector_store_query(
         self, query: VectorStoreQuery
@@ -537,6 +575,7 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
 
         Args:
             query: VectorStoreQuery object containing query parameters
+
         """
         conditions = []
 
@@ -561,6 +600,7 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
 
         Args:
             scored_points: List of ScoredPoints returned from Actian Vector AI search query
+
         """
         ids = []
         nodes = []
@@ -577,9 +617,7 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
 
         return VectorStoreQueryResult(nodes=nodes, similarities=similarities, ids=ids)
 
-    def _lazy_client_operation_check(
-        self, ensure_collection_exists: bool = True
-    ) -> None:
+    def _lazy_client_operation_check(self) -> None:
         if self._client is None:
             raise ValueError(
                 "Synchronous client is not initialized. Please initialize the ActianVectorAIVectorStore with a VectorAIClient to use synchronous methods."
@@ -595,26 +633,12 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
             self._clear_existing_collection = False
             self._collection_exists = False
 
-        if not self._lazy_collection_create:
+        if not self._lazy_collection_exist_check:
             if self._client.collections.exists(self.collection_name):
                 self._collection_exists = True
-            elif self.collection_kwargs is not None:
-                self._client.collections.create(
-                    self.collection_name, **self.collection_kwargs or {}
-                )
-                self._collection_exists = True
-            else:
-                self._collection_exists = False
-            self._lazy_collection_create = True
+            self._lazy_collection_exist_check = True
 
-        if ensure_collection_exists:
-            assert (
-                self._collection_exists
-            ), f"Collection {self.collection_name} does not exist. Please add nodes to the collection before attempting to perform operations that require an existing collection."
-
-    async def _lazy_async_client_operation_check(
-        self, ensure_collection_exists: bool = True
-    ) -> None:
+    async def _lazy_async_client_operation_check(self) -> None:
         if self._async_client is None:
             raise ValueError(
                 "Async client is not initialized. Please initialize the ActianVectorAIVectorStore with an AsyncVectorAIClient to use asynchronous methods."
@@ -630,51 +654,36 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
             self._clear_existing_collection = False
             self._collection_exists = False
 
-        if not self._lazy_collection_create:
+        if not self._lazy_collection_exist_check:
             if await self._async_client.collections.exists(self.collection_name):
                 self._collection_exists = True
-            elif self.collection_kwargs is not None:
-                await self._async_client.collections.create(
-                    self.collection_name, **self.collection_kwargs or {}
-                )
-                self._collection_exists = True
-            else:
-                self._collection_exists = False
-            self._lazy_collection_create = True
-
-        if ensure_collection_exists:
-            assert (
-                self._collection_exists
-            ), f"Collection {self.collection_name} does not exist. Please add nodes to the collection before attempting to perform operations that require an existing collection."
+            self._lazy_collection_exist_check = True
 
     def _create_collection_if_not_exists(self, embed_dim: int) -> None:
         if not self._collection_exists:
-            if self.collection_kwargs is not None:
-                self._client.collections.create(
-                    self.collection_name, **self.collection_kwargs or {}
-                )
-            else:
-                # Default to creating collection with cosine distance and HNSW index if no collection kwargs provided
-                self._client.collections.create(
-                    self.collection_name,
-                    vectors_config=VectorParams(
-                        size=embed_dim, distance=Distance.Cosine
-                    ),
-                )
-        self._collection_exists = True
+            _collection_kwargs = self._prepare_collection_kwargs(embed_dim)
+            self._client.collections.create(self.collection_name, **_collection_kwargs)
+            self._collection_exists = True
 
     async def _acreate_collection_if_not_exists(self, embed_dim: int) -> None:
         if not self._collection_exists:
-            if self.collection_kwargs is not None:
-                await self._async_client.collections.create(
-                    self.collection_name, **self.collection_kwargs or {}
-                )
-            else:
-                # Default to creating collection with cosine distance and HNSW index if no collection kwargs provided
-                await self._async_client.collections.create(
-                    self.collection_name,
-                    vectors_config=VectorParams(
-                        size=embed_dim, distance=Distance.Cosine
-                    ),
-                )
-        self._collection_exists = True
+            _collection_kwargs = self._prepare_collection_kwargs(embed_dim)
+            await self._async_client.collections.create(
+                self.collection_name, **_collection_kwargs
+            )
+            self._collection_exists = True
+
+    def _prepare_collection_kwargs(self, embed_dim: int) -> Dict[str, Any]:
+        if self.collection_kwargs is None:
+            self.collection_kwargs = {}
+
+        if self.dense_vector_params is None:
+            self.dense_vector_params = VectorParams(
+                size=embed_dim, distance=Distance.Cosine
+            )
+
+        self.collection_kwargs["vectors_config"] = {
+            self.dense_vector_name: self.dense_vector_params
+        }
+
+        return self.collection_kwargs
