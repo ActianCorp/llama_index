@@ -38,6 +38,7 @@ from actian_vectorai.models import (
     ScoredPoint,
     UpdateStatus,
     VectorParams,
+    RetrievedPoint,
 )
 
 
@@ -168,7 +169,7 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
             self._client.connect()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> Self:
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         """
         Exit synchronous context and close the client connection.
 
@@ -177,13 +178,9 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
             exc_val: Exception instance raised in the context, if any.
             exc_tb: Traceback associated with the raised exception, if any.
 
-        Returns:
-            This vector store instance.
-
         """
         if self._client.is_connected:
             self._client.shutdown()
-        return self
 
     async def __aenter__(self) -> Self:
         """
@@ -204,7 +201,7 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
             await self._async_client.connect()
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> Self:
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         """
         Exit asynchronous context and close the async client connection.
 
@@ -213,13 +210,9 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
             exc_val: Exception instance raised in the context, if any.
             exc_tb: Traceback associated with the raised exception, if any.
 
-        Returns:
-            This vector store instance.
-
         """
         if self._async_client is not None and self._async_client.is_connected:
             await self._async_client.close()
-        return self
 
     @classmethod
     def class_name(cls) -> str:
@@ -247,6 +240,7 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
         self,
         node_ids: Optional[List[str]] = None,
         filters: Optional[MetadataFilters] = None,
+        limit: Optional[int] = 9999,
     ) -> List[BaseNode]:
         """
         Fetch nodes by id and/or metadata filters.
@@ -254,13 +248,10 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
         Args:
             node_ids: Optional list of node IDs to match.
             filters: Optional metadata filters to apply.
+            limit: Optional maximum number of nodes to return. Defaults to 9999.
 
         Returns:
             Matching nodes in the collection.
-
-        Note:
-            This method is currently unimplemented because the underlying
-            Actian Vector AI client does not yet expose a scroll API.
 
         """
         self._lazy_client_operation_check()
@@ -268,14 +259,21 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
         if not self._collection_exists:
             return []
 
-        raise NotImplementedError(  # Waiting on scroll API support in the Actian Vector AI client
-            "ActianVectorAIVectorStore.get_nodes() is not implemented."
+        result = self._client.points.scroll(
+            self.collection_name,
+            filter=self._build_db_filter_from_node_ids_doc_ids_and_metadata_filters(
+                node_ids=node_ids, doc_ids=None, filters=filters
+            ),
+            limit=limit,
         )
+
+        return self._build_base_nodes_from_retrieved_points(result[0])
 
     async def aget_nodes(
         self,
         node_ids: Optional[List[str]] = None,
         filters: Optional[MetadataFilters] = None,
+        limit: Optional[int] = 9999,
     ) -> List[BaseNode]:
         """
         Async version of get_nodes.
@@ -283,13 +281,10 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
         Args:
             node_ids: Optional list of node IDs to match.
             filters: Optional metadata filters to apply.
+            limit: Optional maximum number of nodes to return. Defaults to 9999.
 
         Returns:
             Matching nodes in the collection.
-
-        Note:
-            This method is currently unimplemented because the underlying
-            Actian Vector AI client does not yet expose a scroll API.
 
         """
         await self._lazy_async_client_operation_check()
@@ -297,9 +292,15 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
         if not self._collection_exists:
             return []
 
-        raise NotImplementedError(  # Waiting on scroll API support in the Actian Vector AI client
-            "ActianVectorAIVectorStore.aget_nodes() is not implemented."
+        result = await self._async_client.points.scroll(
+            self.collection_name,
+            filter=self._build_db_filter_from_node_ids_doc_ids_and_metadata_filters(
+                node_ids=node_ids, doc_ids=None, filters=filters
+            ),
+            limit=limit,
         )
+
+        return self._build_base_nodes_from_retrieved_points(result[0])
 
     def add(
         self,
@@ -744,19 +745,41 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
             Actian filter that combines all supplied constraints.
 
         """
+        return self._build_db_filter_from_node_ids_doc_ids_and_metadata_filters(
+            node_ids=query.node_ids,
+            doc_ids=query.doc_ids,
+            filters=query.filters,
+        )
+
+    def _build_db_filter_from_node_ids_doc_ids_and_metadata_filters(
+        self,
+        node_ids: Optional[List[str]] = None,
+        doc_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+    ) -> Filter:
+        """
+        Build an Actian filter from node IDs, document IDs, and metadata filters.
+
+        Args:
+            node_ids: Optional list of node IDs to match.
+            doc_ids: Optional list of document IDs to match.
+            filters: Optional metadata filters to apply.
+
+        Returns:
+            Actian filter that combines all supplied constraints.
+
+        """
         conditions = []
 
-        if query.node_ids is not None and len(query.node_ids) > 0:
-            conditions.append(has_id(query.node_ids))
+        if node_ids is not None and len(node_ids) > 0:
+            conditions.append(has_id(node_ids))
 
-        if query.doc_ids is not None and len(query.doc_ids) > 0:
-            conditions.append(Field("ref_doc_id").any_of(query.doc_ids))
+        if doc_ids is not None and len(doc_ids) > 0:
+            conditions.append(Field("ref_doc_id").any_of(doc_ids))
 
-        if query.filters is not None:
+        if filters is not None:
             conditions.append(
-                Condition(
-                    filter=self._build_db_filter_from_metadata_filters(query.filters)
-                )
+                Condition(filter=self._build_db_filter_from_metadata_filters(filters))
             )
 
         return Filter(must=conditions) if conditions else None
@@ -788,6 +811,27 @@ class ActianVectorAIVectorStore(BasePydanticVectorStore):
             similarities.append(similarity)
 
         return VectorStoreQueryResult(nodes=nodes, similarities=similarities, ids=ids)
+
+    def _build_base_nodes_from_retrieved_points(
+        self, retrieved_points: List[RetrievedPoint]
+    ) -> List[BaseNode]:
+        """
+        Convert Actian RetrievedPoint objects into LlamaIndex BaseNode objects.
+
+        Args:
+            retrieved_points: List of RetrievedPoint objects returned by Actian Vector AI.
+
+        Returns:
+            List of BaseNode objects constructed from the retrieved points.
+
+        """
+        nodes = []
+        for point in retrieved_points:
+            node = metadata_dict_to_node(point.payload)
+            node.embedding = point.vectors
+            nodes.append(node)
+
+        return nodes
 
     def _lazy_client_operation_check(self) -> None:
         """
