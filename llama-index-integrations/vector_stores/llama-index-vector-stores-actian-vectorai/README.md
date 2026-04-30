@@ -185,12 +185,3 @@ vector_store.delete_nodes(
 ## Limitations
 
 - Only `VectorStoreQueryMode.DEFAULT` (dense vector search) is supported.
-
-## Running Tests
-
-Tests require a running Actian VectorAI DB instance. Set `VECTORAI_SERVER_URL` to override the default endpoint:
-
-```bash
-export VECTORAI_SERVER_URL="localhost:6574"
-pytest
-```
